@@ -361,7 +361,7 @@ document.addEventListener('DOMContentLoaded', function() {
           }
         }
 
-        var apiUrl = 'https://avhell.bsite.net/Albumes.ashx?q=' + encodeURIComponent(query);
+        var apiUrl = 'https://avhell.bsite.net/Handlers/Albumes.ashx?q=' + encodeURIComponent(query);
 
         fetch(apiUrl)
           .then(function(response) {
@@ -466,102 +466,6 @@ document.addEventListener('DOMContentLoaded', function() {
   });
 })();
 
-
-/* ============================================================
-   MÓDULO: AVISOS FLOTANTES (Widget HTML3)
-   ============================================================ */
-(function() {
-    function cargarUltimoAviso() {
-        var feedURL = '/feeds/posts/default/-/Avisos?alt=json&max-results=1&callback=mostrarAvisoOMC';
-        var script = document.createElement('script');
-        script.src = feedURL;
-        document.head.appendChild(script);
-    }
-
-    function mostrarAvisoOMC(json) {
-        var entry = json.feed.entry;
-        if (!entry || entry.length === 0) return;
-
-        var titulo = entry[0].title.$t;
-        var link = '';
-        for (var i = 0; i < entry[0].link.length; i++) {
-            if (entry[0].link[i].rel === 'alternate') {
-                link = entry[0].link[i].href;
-                break;
-            }
-        }
-
-        var avisoGuardado = localStorage.getItem('omc_ultimo_aviso');
-        if (avisoGuardado === link) {
-            return; 
-        }
-        localStorage.setItem('omc_ultimo_aviso', link);
-
-        var contenido = entry[0].content ? entry[0].content.$t : '';
-        var textoLimpio = '';
-        if (contenido) {
-            var tempDiv = document.createElement('div');
-            tempDiv.innerHTML = contenido;
-            var scripts = tempDiv.querySelectorAll('script, style');
-            scripts.forEach(function(el) { el.remove(); });
-            textoLimpio = tempDiv.textContent || tempDiv.innerText || '';
-            textoLimpio = textoLimpio.replace(/\s+/g, ' ').trim();
-        }
-
-        if (!textoLimpio) {
-            textoLimpio = 'Haz clic aquí para leer la información completa.';
-        }
-
-        var avisoEnlace = document.createElement('a');
-        avisoEnlace.id = 'omc-aviso-flotante';
-        avisoEnlace.href = link;
-        
-        avisoEnlace.innerHTML = `
-            <div class="omc-aviso-icono">📢</div>
-            <div class="omc-aviso-textos">
-                <div class="omc-aviso-titulo">${titulo}</div>
-                <div class="omc-aviso-desc">${textoLimpio}</div>
-            </div>
-            <div class="omc-btn-cerrar" onclick="cerrarAvisoManual(event, this)">✖</div>
-        `;
-
-        document.body.appendChild(avisoEnlace);
-
-        setTimeout(function() {
-            var aviso = document.getElementById('omc-aviso-flotante');
-            if (aviso) {
-                aviso.classList.add('oculto');
-                setTimeout(function() { aviso.remove(); }, 300);
-            }
-        }, 6000); 
-    }
-
-    function cerrarAvisoManual(evento, elemento) {
-        evento.preventDefault();
-        evento.stopPropagation();
-        var aviso = elemento.closest('#omc-aviso-flotante');
-        if (aviso) {
-            aviso.classList.add('oculto');
-            setTimeout(function() { aviso.remove(); }, 300);
-        }
-    }
-
-    document.addEventListener('DOMContentLoaded', function() {
-        cargarUltimoAviso();
-        
-        var fantasma = document.getElementById('omc-aviso-fantasma');
-        if (fantasma) {
-            var bloggerContainer = fantasma.closest('.widget');
-            if (bloggerContainer) {
-                bloggerContainer.style.display = 'none';
-                bloggerContainer.style.margin = '0';
-                bloggerContainer.style.padding = '0';
-            }
-        }
-    });
-})();
-
-
 /* ============================================================
    MÓDULO: CHAT (Widget HTML4)
    ============================================================ */
@@ -578,7 +482,7 @@ document.addEventListener('DOMContentLoaded', function() {
             
             if (!chatLoaded) {
                 var iframe = document.createElement("iframe");
-                iframe.src = "https://avhell.bsite.net/Default.aspx";
+                iframe.src = "https://avhell.bsite.net/Chat/Chat.aspx";
                 iframe.style.width = "100%";
                 iframe.style.height = "100%";
                 iframe.style.border = "none";
@@ -844,7 +748,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
 
         // CARGA INICIAL
-        fetch('https://avhell.bsite.net/PlaylistApi.ashx')
+        fetch('https://avhell.bsite.net/Reproductor/PlaylistApi.ashx')
             .then(function(response) { return response.json(); })
             .then(function(data) {
                 if (data && data.length > 0) {
@@ -989,11 +893,12 @@ document.addEventListener('DOMContentLoaded', function() {
             clearTimeout(resizeTimeout);
             resizeTimeout = setTimeout(checkMarquee, 200);
         });
-    });
 
-    // Limpia estilos de Blogger
-    (function() {
-        var playerWidget = document.getElementById("omc-player-widget");
+        // ============================================================
+        // LIMPIEZA DEL CONTENEDOR DEL WIDGET DE BLOGGER
+        // (se ejecuta después de que el DOM esté listo)
+        // ============================================================
+        var playerWidget = document.getElementById('omc-player-widget');
         if (playerWidget) {
             var bloggerContainer = playerWidget.closest('.widget');
             if (bloggerContainer) {
@@ -1005,9 +910,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 document.body.appendChild(playerWidget);
             }
         }
-    })();
-})();
-
+    }); // fin DOMContentLoaded
+})(); // fin módulo
 
 /* ============================================================
    MÓDULO: FOOTER (Widget HTML6)
@@ -1154,5 +1058,63 @@ document.addEventListener('DOMContentLoaded', function() {
                 btnSubir.classList.remove('visible');
             }
         }
+    });
+})();
+
+/* ============================================================
+   MÓDULO: COMPILACIONES (Widget HTML - reemplazo de Label4)
+   ============================================================ */
+(function() {
+    // Esperamos a que el DOM esté listo antes de ejecutar
+    document.addEventListener('DOMContentLoaded', function() {
+        const listEl = document.getElementById('omc-compilaciones-list');
+        if (!listEl) return;
+
+        fetch('https://avhell.bsite.net/Handlers/Compilaciones.ashx')
+            .then(response => {
+                if (!response.ok) throw new Error('Error en la respuesta del servidor');
+                return response.json();
+            })
+            .then(data => {
+                if (!data || data.length === 0) {
+                    listEl.innerHTML = '<li>No hay compilaciones disponibles</li>';
+                    return;
+                }
+
+                // Agrupar por título (ya viene limpio desde el handler)
+                const grupos = {};
+
+                data.forEach(item => {
+                    const titulo = item.Titulo;
+                    if (!grupos[titulo]) {
+                        grupos[titulo] = {
+                            titulo: titulo,
+                            anio: item.Anio,
+                            link: item.Link
+                        };
+                    } else {
+                        if (item.Anio > grupos[titulo].anio) {
+                            grupos[titulo].anio = item.Anio;
+                        }
+                    }
+                });
+
+                // Ordenar por año descendente y mostrar
+                const lista = Object.values(grupos).sort((a, b) => b.anio - a.anio || a.titulo.localeCompare(b.titulo));
+
+                listEl.innerHTML = '';
+                lista.forEach(item => {
+                    const li = document.createElement('li');
+                    const a = document.createElement('a');
+                    a.href = item.link;
+                    a.textContent = item.titulo + ' (' + item.anio + ')';
+                    li.appendChild(a);
+                    listEl.appendChild(li);
+                });
+            })
+            .catch(error => {
+                console.error('Error al cargar compilaciones:', error);
+                listEl.innerHTML = '<li>Error al cargar compilaciones</li>';
+            });
     });
 })();
