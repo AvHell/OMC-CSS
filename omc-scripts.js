@@ -1,14 +1,37 @@
 /* ============================================================
    OMC - OLD METAL COMMANDER
-   TODOS LOS SCRIPTS UNIFICADOS (v1.0)
+   TODOS LOS SCRIPTS UNIFICADOS (v1.1) - CON CACHÉ
    ============================================================ */
 
-/* ============================================================
-   MÓDULO: SCRIPTS GLOBALES DEL TEMA (HEAD)
-   Contiene: bandasMap, cargarBandas, inicializarBusqueda,
-             cargarSliderMarquee, procesarEntradas e
-             inicialización principal.
-   ============================================================ */
+// Cargar el módulo de caché
+function loadOMCCache() {
+    return new Promise(function(resolve, reject) {
+        if (typeof OMC !== 'undefined' && OMC.Cache) {
+            resolve();
+            return;
+        }
+        
+        var script = document.createElement('script');
+        script.src = 'https://avhell.bsite.net/js/omc-cache.js';
+        script.onload = function() {
+            console.log('[OMC] Módulo de caché cargado');
+            resolve();
+        };
+        script.onerror = function() {
+            console.warn('[OMC] No se pudo cargar el caché');
+            reject();
+        };
+        document.head.appendChild(script);
+    });
+}
+
+// Cargar caché ANTES de todo
+loadOMCCache().then(function() {
+    console.log('[OMC] Caché listo');
+}).catch(function() {
+    console.log('[OMC] Caché no disponible, funcionando sin él');
+});
+
 // VARIABLES GLOBALES
 var bandasMap = {};
 var todasBandas = [];
@@ -517,13 +540,14 @@ document.addEventListener('DOMContentLoaded', function() {
 
 
 /* ============================================================
-   MÓDULO: REPRODUCTOR OMC (Widget HTML5)
+   MÓDULO: REPRODUCTOR OMC (Widget HTML5) - CORREGIDO
    ============================================================ */
 (function() {
     document.addEventListener('DOMContentLoaded', function() {
         let playlist = [];
         let currentTrackIndex = 0;
         let waveInterval = null;
+        let isUserInteracted = false;
 
         const audioEl = document.getElementById('omc-audio-element');
         const playPauseBtn = document.getElementById('omc-play-pause');
@@ -544,6 +568,54 @@ document.addEventListener('DOMContentLoaded', function() {
         const iconPlay = '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
         const iconPause = '<svg viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
 
+        // ============================================================
+        // FUNCIÓN PARA REPRODUCIR CON MANEJO DE ERRORES
+        // ============================================================
+        function playAudio() {
+            if (playlist.length === 0) return;
+            
+            var playPromise = audioEl.play();
+            
+            if (playPromise !== undefined) {
+                playPromise
+                    .then(function() {
+                        playPauseBtn.innerHTML = iconPause;
+                        startWaveAnimation();
+                        if ('mediaSession' in navigator) {
+                            navigator.mediaSession.playbackState = 'playing';
+                        }
+                    })
+                    .catch(function(error) {
+                        console.log('⚠️ Error al reproducir:', error);
+                        // Si es error de interacción, mostrar mensaje
+                        if (error.name === 'NotAllowedError') {
+                            playPauseBtn.innerHTML = iconPlay;
+                            stopWaveAnimation();
+                            // Mostrar indicador visual
+                            trackTitleEl.textContent = '🔊 Haz clic para reproducir';
+                            setTimeout(function() {
+                                trackTitleEl.textContent = playlist[currentTrackIndex]?.title || '';
+                            }, 3000);
+                        }
+                    });
+            }
+        }
+
+        // ============================================================
+        // FUNCIÓN PARA PAUSAR
+        // ============================================================
+        function pauseAudio() {
+            audioEl.pause();
+            playPauseBtn.innerHTML = iconPlay;
+            stopWaveAnimation();
+            if ('mediaSession' in navigator) {
+                navigator.mediaSession.playbackState = 'paused';
+            }
+        }
+
+        // ============================================================
+        // GENERAR ONDA
+        // ============================================================
         function generarOndaIrregular() {
             const barras = 50;
             let svgWave = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100' preserveAspectRatio='none'>`;
@@ -559,6 +631,9 @@ document.addEventListener('DOMContentLoaded', function() {
             progressSlider.style.maskImage = `url("${encoded}")`;
         }
 
+        // ============================================================
+        // PLAYLIST
+        // ============================================================
         function groupByBand(tracks) {
             const map = {};
             tracks.forEach(t => {
@@ -577,15 +652,17 @@ document.addEventListener('DOMContentLoaded', function() {
             allBtn.addEventListener('click', function() {
                 currentTrackIndex = 0;
                 loadTrack(currentTrackIndex);
-                audioEl.play();
-                playPauseBtn.innerHTML = iconPause;
-                playlistOverlay.classList.remove('active');
-                renderPlaylist();
-                generarOndaIrregular();
-                updateTrackNumber();
-                startWaveAnimation();
-                updateMediaSession();
+                // Esperar a que cargue antes de reproducir
+                setTimeout(function() {
+                    playAudio();
+                    playlistOverlay.classList.remove('active');
+                    renderPlaylist();
+                    generarOndaIrregular();
+                    updateTrackNumber();
+                    updateMediaSession();
+                }, 200);
             });
+            
             playlistList.appendChild(allBtn);
 
             const groups = groupByBand(playlist);
@@ -612,27 +689,49 @@ document.addEventListener('DOMContentLoaded', function() {
                     li.addEventListener('click', function() {
                         currentTrackIndex = globalIndex;
                         loadTrack(currentTrackIndex);
-                        audioEl.play();
-                        playPauseBtn.innerHTML = iconPause;
-                        playlistOverlay.classList.remove('active');
-                        renderPlaylist();
-                        generarOndaIrregular();
-                        updateTrackNumber();
-                        startWaveAnimation();
-                        updateMediaSession();
+                        setTimeout(function() {
+                            playAudio();
+                            playlistOverlay.classList.remove('active');
+                            renderPlaylist();
+                            generarOndaIrregular();
+                            updateTrackNumber();
+                            updateMediaSession();
+                        }, 200);
                     });
                     playlistList.appendChild(li);
                 });
             });
         }
 
+        // ============================================================
+        // CARGAR TRACK (CORREGIDO)
+        // ============================================================
         function loadTrack(index) {
             if (playlist.length === 0) return;
             const track = playlist[index];
+            
+            // Pausar y resetear
+            pauseAudio();
+            audioEl.currentTime = 0;
+            
+            // Cargar nuevo track
             audioEl.src = track.url;
             bandNameEl.textContent = track.band;
             trackTitleEl.textContent = track.title;
-            coverEl.src = track.cover || 'https://via.placeholder.com/250';
+            
+            // Cargar cover con caché si está disponible
+            if (track.cover && window.OMC && window.OMC.Cache) {
+                window.OMC.Cache.load(track.cover)
+                    .then(function(cachedImg) {
+                        coverEl.src = cachedImg.src;
+                    })
+                    .catch(function() {
+                        coverEl.src = track.cover || 'https://via.placeholder.com/250';
+                    });
+            } else {
+                coverEl.src = track.cover || 'https://via.placeholder.com/250';
+            }
+            
             updateTrackNumber();
             progressSlider.value = 0;
             progressSlider.style.setProperty('--progress', '0%');
@@ -641,6 +740,9 @@ document.addEventListener('DOMContentLoaded', function() {
             checkMarquee();
             renderPlaylist();
             updateMediaSession();
+            
+            // Marcar que se ha interactuado
+            isUserInteracted = true;
         }
 
         function updateTrackNumber() {
@@ -649,9 +751,13 @@ document.addEventListener('DOMContentLoaded', function() {
             trackNumberEl.textContent = `Track ${current} de ${total}`;
         }
 
+        // ============================================================
+        // MARQUEE
+        // ============================================================
         function checkMarquee() {
             const el = trackTitleEl;
             const wrapper = el.closest('.omc-title-wrapper');
+            if (!wrapper) return;
             const containerWidth = wrapper.clientWidth;
             el.style.display = 'inline-block';
             el.style.whiteSpace = 'nowrap';
@@ -672,6 +778,9 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         }
 
+        // ============================================================
+        // MEDIA SESSION
+        // ============================================================
         function updateMediaSession() {
             if (playlist.length === 0) return;
             const track = playlist[currentTrackIndex];
@@ -693,44 +802,41 @@ document.addEventListener('DOMContentLoaded', function() {
 
             navigator.mediaSession.setActionHandler('play', function() {
                 if (playlist.length === 0) return;
-                audioEl.play();
-                playPauseBtn.innerHTML = iconPause;
-                startWaveAnimation();
-                if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+                playAudio();
             });
 
             navigator.mediaSession.setActionHandler('pause', function() {
-                audioEl.pause();
-                playPauseBtn.innerHTML = iconPlay;
-                stopWaveAnimation();
-                if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+                pauseAudio();
             });
 
             navigator.mediaSession.setActionHandler('nexttrack', function() {
                 if (playlist.length === 0) return;
                 currentTrackIndex = (currentTrackIndex + 1) % playlist.length;
                 loadTrack(currentTrackIndex);
-                audioEl.play();
-                playPauseBtn.innerHTML = iconPause;
-                generarOndaIrregular();
-                updateTrackNumber();
-                startWaveAnimation();
-                updateMediaSession();
+                setTimeout(function() {
+                    playAudio();
+                    generarOndaIrregular();
+                    updateTrackNumber();
+                    updateMediaSession();
+                }, 200);
             });
 
             navigator.mediaSession.setActionHandler('previoustrack', function() {
                 if (playlist.length === 0) return;
                 currentTrackIndex = (currentTrackIndex - 1 + playlist.length) % playlist.length;
                 loadTrack(currentTrackIndex);
-                audioEl.play();
-                playPauseBtn.innerHTML = iconPause;
-                generarOndaIrregular();
-                updateTrackNumber();
-                startWaveAnimation();
-                updateMediaSession();
+                setTimeout(function() {
+                    playAudio();
+                    generarOndaIrregular();
+                    updateTrackNumber();
+                    updateMediaSession();
+                }, 200);
             });
         }
 
+        // ============================================================
+        // ANIMACIÓN DE ONDA
+        // ============================================================
         function startWaveAnimation() {
             if (waveInterval) clearInterval(waveInterval);
             if (!audioEl.paused && !audioEl.ended) {
@@ -747,7 +853,9 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         }
 
+        // ============================================================
         // CARGA INICIAL
+        // ============================================================
         fetch('https://avhell.bsite.net/Reproductor/PlaylistApi.ashx')
             .then(function(response) { return response.json(); })
             .then(function(data) {
@@ -769,7 +877,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 trackTitleEl.textContent = "Error de servidor";
             });
 
+        // ============================================================
         // CONTROLES
+        // ============================================================
         playlistBtn.addEventListener('click', function() {
             playlistOverlay.classList.toggle('active');
         });
@@ -777,15 +887,9 @@ document.addEventListener('DOMContentLoaded', function() {
         playPauseBtn.addEventListener('click', function() {
             if (playlist.length === 0) return;
             if (audioEl.paused) {
-                audioEl.play();
-                playPauseBtn.innerHTML = iconPause;
-                startWaveAnimation();
-                if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+                playAudio();
             } else {
-                audioEl.pause();
-                playPauseBtn.innerHTML = iconPlay;
-                stopWaveAnimation();
-                if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+                pauseAudio();
             }
         });
 
@@ -793,27 +897,29 @@ document.addEventListener('DOMContentLoaded', function() {
             if (playlist.length === 0) return;
             currentTrackIndex = (currentTrackIndex + 1) % playlist.length;
             loadTrack(currentTrackIndex);
-            audioEl.play();
-            playPauseBtn.innerHTML = iconPause;
-            generarOndaIrregular();
-            updateTrackNumber();
-            startWaveAnimation();
-            updateMediaSession();
+            setTimeout(function() {
+                playAudio();
+                generarOndaIrregular();
+                updateTrackNumber();
+                updateMediaSession();
+            }, 200);
         });
 
         document.getElementById('omc-prev').addEventListener('click', function() {
             if (playlist.length === 0) return;
             currentTrackIndex = (currentTrackIndex - 1 + playlist.length) % playlist.length;
             loadTrack(currentTrackIndex);
-            audioEl.play();
-            playPauseBtn.innerHTML = iconPause;
-            generarOndaIrregular();
-            updateTrackNumber();
-            startWaveAnimation();
-            updateMediaSession();
+            setTimeout(function() {
+                playAudio();
+                generarOndaIrregular();
+                updateTrackNumber();
+                updateMediaSession();
+            }, 200);
         });
 
+        // ============================================================
         // PROGRESO Y VOLUMEN
+        // ============================================================
         audioEl.addEventListener('timeupdate', function() {
             if (audioEl.duration) {
                 const percent = (audioEl.currentTime / audioEl.duration) * 100;
@@ -850,7 +956,9 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         audioEl.volume = volumeSlider.value;
 
+        // ============================================================
         // MINIMIZAR / MAXIMIZAR
+        // ============================================================
         widgetEl.addEventListener('click', function(e) {
             if (widgetEl.classList.contains('minimized')) {
                 widgetEl.classList.remove('minimized');
@@ -863,6 +971,9 @@ document.addEventListener('DOMContentLoaded', function() {
             widgetEl.classList.add('minimized');
         });
 
+        // ============================================================
+        // EVENTOS DEL AUDIO
+        // ============================================================
         audioEl.addEventListener('ended', function() {
             document.getElementById('omc-next').click();
         });
@@ -881,6 +992,9 @@ document.addEventListener('DOMContentLoaded', function() {
             if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
         });
 
+        // ============================================================
+        // UTILIDADES
+        // ============================================================
         function formatTime(seconds) {
             if (isNaN(seconds)) return "0:00";
             const min = Math.floor(seconds / 60);
@@ -895,8 +1009,7 @@ document.addEventListener('DOMContentLoaded', function() {
         });
 
         // ============================================================
-        // LIMPIEZA DEL CONTENEDOR DEL WIDGET DE BLOGGER
-        // (se ejecuta después de que el DOM esté listo)
+        // LIMPIEZA DEL CONTENEDOR
         // ============================================================
         var playerWidget = document.getElementById('omc-player-widget');
         if (playerWidget) {
@@ -910,6 +1023,18 @@ document.addEventListener('DOMContentLoaded', function() {
                 document.body.appendChild(playerWidget);
             }
         }
+
+        // ============================================================
+        // DETECTAR INTERACCIÓN DEL USUARIO
+        // ============================================================
+        document.addEventListener('click', function() {
+            isUserInteracted = true;
+        }, { once: true });
+
+        document.addEventListener('keydown', function() {
+            isUserInteracted = true;
+        }, { once: true });
+
     }); // fin DOMContentLoaded
 })(); // fin módulo
 
