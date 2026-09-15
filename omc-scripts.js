@@ -505,7 +505,7 @@ document.addEventListener('DOMContentLoaded', function() {
             
             if (!chatLoaded) {
                 var iframe = document.createElement("iframe");
-                iframe.src = "https://avhell.bsite.net/Chat/Chat.aspx";
+                iframe.src = "https://avhell.bsite.net/Chat/chathtml.ashx";
                 iframe.style.width = "100%";
                 iframe.style.height = "100%";
                 iframe.style.border = "none";
