@@ -1,5 +1,8 @@
 /* ============================================================
-   OMC-CACHE: Caché para imágenes de Boveda v3.3 
+   OMC-CACHE: Caché para imágenes de Boveda v3.4
+   - Procesamiento por lotes (concurrencia limitada)
+   - Evita reprocesar imágenes ya procesadas
+   - Observador mejorado
    ============================================================ */
 
 (function() {
@@ -11,8 +14,11 @@
         BOVEDA_DOMAIN: 'https://avhell.bsite.net/Boveda',
         BOVEDA_RELATIVE: '/Boveda/',
         DEBUG: true,
-        FAILED_CACHE_DURATION: 1, // Reducido a 1 minuto para que reintente pronto
-        TIMEOUT: 15000 // 15 segundos
+        FAILED_CACHE_DURATION: 1,
+        TIMEOUT: 15000,
+        CONCURRENCY: 4,        // cuántas imágenes procesar a la vez
+        INIT_DELAY: 300,       // ms antes de la primera pasada
+        SECOND_PASS: 2500      // ms para la segunda pasada
     };
 
     const FAILED_KEY = CONFIG.STORAGE_PREFIX + '_failed_';
@@ -33,11 +39,11 @@
     }
 
     // ============================================================
-    // UTILIDADES MEJORADAS
+    // UTILIDADES
     // ============================================================
     function isBovedaImage(url) {
         if (!url) return false;
-        return url.includes(CONFIG.BOVEDA_DOMAIN) || 
+        return url.includes(CONFIG.BOVEDA_DOMAIN) ||
                url.includes(CONFIG.BOVEDA_RELATIVE);
     }
 
@@ -107,7 +113,6 @@
                     expires: getNow() + (CONFIG.CACHE_DURATION * 60 * 1000)
                 };
                 localStorage.setItem(key, JSON.stringify(entry));
-                // Limpiar fallidos
                 var failedKey = getFailedKey(url);
                 localStorage.removeItem(failedKey);
                 log('✅ Cacheada:', url.substring(0, 50) + '...');
@@ -210,7 +215,7 @@
         stats: function() {
             var keys = Object.keys(localStorage);
             var total = 0, active = 0, size = 0, failed = 0;
-            
+
             keys.forEach(function(key) {
                 if (key.startsWith(CONFIG.STORAGE_PREFIX) && !key.startsWith(FAILED_KEY)) {
                     total++;
@@ -229,7 +234,7 @@
                     } catch (e) {}
                 }
             });
-            
+
             return {
                 total: total,
                 active: active,
@@ -241,7 +246,7 @@
     };
 
     // ============================================================
-    // CARGAR IMAGEN CON CACHÉ (MEJORADO)
+    // CARGAR IMAGEN CON CACHÉ
     // ============================================================
     function loadImageWithCache(url) {
         return new Promise(function(resolve, reject) {
@@ -251,7 +256,7 @@
             }
 
             var normalized = normalizeUrl(url);
-            
+
             if (!isBovedaImage(url)) {
                 var img = new Image();
                 img.onload = function() { resolve(img); };
@@ -260,17 +265,14 @@
                 return;
             }
 
-            // Si está en fallidos, reintentar después de 1 minuto
             if (Cache.isFailed(normalized)) {
-                // No rechazar, solo cargar normal sin caché
                 var img = new Image();
-                img.onload = function() { 
-                    // Si carga bien, limpiar fallido
+                img.onload = function() {
                     Cache.set(normalized, img.src);
-                    resolve(img); 
+                    resolve(img);
                 };
-                img.onerror = function() { 
-                    reject(new Error('Imagen fallida')); 
+                img.onerror = function() {
+                    reject(new Error('Imagen fallida'));
                 };
                 img.src = normalized;
                 return;
@@ -296,7 +298,7 @@
     function loadFromNetwork(url) {
         return new Promise(function(resolve, reject) {
             var img = new Image();
-            
+
             var timeoutId = setTimeout(function() {
                 img.src = '';
                 reject(new Error('Timeout'));
@@ -317,67 +319,91 @@
                     resolve(img);
                 }
             };
-            
+
             img.onerror = function() {
                 clearTimeout(timeoutId);
                 Cache.setFailed(url);
                 reject(new Error('Error al cargar: ' + url));
             };
-            
+
             img.src = url;
         });
     }
 
     // ============================================================
-    // PROCESAR IMÁGENES (MEJORADO)
+    // PROCESAR IMÁGENES POR LOTES (CONCURRENCIA LIMITADA)
     // ============================================================
+    var isProcessing = false;
+
     function processAllBovedaImages() {
-        // Buscar imágenes con URL absoluta o relativa
-        var selector = 'img[src*="/Boveda/"], img[src*="Boveda"], img[data-src*="/Boveda/"], img[data-src*="Boveda"]';
-        var images = document.querySelectorAll(selector);
-        
-        if (images.length === 0) {
-            log('⚠️ No se encontraron imágenes de Bóveda');
-            return { processed: 0, errors: 0 };
+        if (isProcessing) {
+            log('⏳ Ya hay un procesamiento en curso, se omite');
+            return;
         }
-        
-        log('🔄 Procesando ' + images.length + ' imágenes de Bóveda...');
-        
+
+        var selector = 'img[src*="/Boveda/"], img[src*="Boveda"], img[data-src*="/Boveda/"], img[data-src*="Boveda"]';
+        var allImages = Array.prototype.slice.call(document.querySelectorAll(selector));
+
+        // Filtrar las que ya fueron procesadas
+        var pending = allImages.filter(function(img) {
+            return !img.dataset.omcProcessed;
+        });
+
+        if (pending.length === 0) {
+            log('⚠️ No hay imágenes nuevas de Bóveda (' + allImages.length + ' ya procesadas)');
+            return;
+        }
+
+        isProcessing = true;
+        log('🔄 Procesando ' + pending.length + ' de ' + allImages.length + ' imágenes (lotes de ' + CONFIG.CONCURRENCY + ')...');
+
+        var index = 0;
         var processed = 0;
         var errors = 0;
 
-        images.forEach(function(img) {
-            var url = img.src || img.getAttribute('data-src');
-            if (url && isBovedaImage(url)) {
-                // No esperar la carga, procesar en paralelo
-                loadImageWithCache(url)
-                    .then(function(cachedImg) {
-                        if (img.src && img.src !== cachedImg.src) {
-                            img.src = cachedImg.src;
-                            processed++;
-                        }
-                    })
-                    .catch(function(error) {
-                        errors++;
-                    });
+        function processBatch() {
+            if (index >= pending.length) {
+                isProcessing = false;
+                log('✅ Procesadas: ' + processed + ', errores: ' + errors);
+                var stats = Cache.stats();
+                log('📊 Caché actual:', stats);
+                return;
             }
-        });
 
-        // Mostrar estadísticas después de un momento
-        setTimeout(function() {
-            var stats = Cache.stats();
-            log('📊 Caché actual:', stats);
-        }, 3000);
+            var batch = pending.slice(index, index + CONFIG.CONCURRENCY);
+            index += CONFIG.CONCURRENCY;
 
-        return { processed: processed, errors: errors };
+            Promise.all(batch.map(function(img) {
+                var url = img.src || img.getAttribute('data-src');
+                img.dataset.omcProcessed = 'true';
+
+                if (!url || !isBovedaImage(url)) return Promise.resolve();
+
+                return loadImageWithCache(url).then(function(cachedImg) {
+                    if (img.src && img.src !== cachedImg.src) {
+                        img.src = cachedImg.src;
+                    }
+                    processed++;
+                }).catch(function() {
+                    errors++;
+                });
+            })).then(processBatch);
+        }
+
+        processBatch();
     }
 
     // ============================================================
-    // FUNCIÓN PARA FORZAR RECARGA DE IMÁGENES FALLIDAS
+    // FORZAR RECARGA DE FALLIDAS
     // ============================================================
     function forceReloadFailed() {
         log('🔄 Forzando recarga de imágenes fallidas...');
         Cache.clearFailed();
+        // Limpiar marca de procesadas para que se reintenten
+        var selector = 'img[src*="/Boveda/"], img[src*="Boveda"], img[data-src*="/Boveda/"], img[data-src*="Boveda"]';
+        document.querySelectorAll(selector).forEach(function(img) {
+            delete img.dataset.omcProcessed;
+        });
         processAllBovedaImages();
     }
 
@@ -385,30 +411,28 @@
     // INICIALIZACIÓN
     // ============================================================
     function init() {
-        log('🚀 OMC-Cache inicializado');
-        
-        // Limpiar expirados
+        log('🚀 OMC-Cache v3.4 inicializado');
+
         Cache.cleanExpired();
-        
+
         var stats = Cache.stats();
         log('📊 Estadísticas iniciales:', stats);
 
-        // Si hay muchas fallidas, limpiarlas automáticamente
         if (stats.failed > 100) {
             log('⚠️ Demasiadas fallidas (' + stats.failed + '), limpiando...');
             Cache.clearFailed();
         }
 
-        // Procesar imágenes con delays
+        // Primera pasada rápida
         setTimeout(function() {
             processAllBovedaImages();
-        }, 1000);
+        }, CONFIG.INIT_DELAY);
 
+        // Segunda pasada por si el DOM cambió
         setTimeout(function() {
             processAllBovedaImages();
-        }, 3000);
+        }, CONFIG.SECOND_PASS);
 
-        // Configurar observador
         setupImageObserver();
     }
 
@@ -420,45 +444,46 @@
 
         var observer = new MutationObserver(function(mutations) {
             var hasNewImages = false;
-            
+
             mutations.forEach(function(mutation) {
                 mutation.addedNodes.forEach(function(node) {
-                    if (node.nodeType === 1) {
-                        if (node.tagName === 'IMG') {
-                            var url = node.src || node.getAttribute('data-src');
-                            if (url && isBovedaImage(url) && !node.dataset.omcProcessed) {
-                                hasNewImages = true;
-                                node.dataset.omcProcessed = 'true';
-                                loadImageWithCache(url).then(function(cachedImg) {
-                                    if (node.src && node.src !== cachedImg.src) {
-                                        node.src = cachedImg.src;
-                                    }
-                                }).catch(function() {});
-                            }
-                        }
-                        if (node.querySelectorAll) {
-                            var images = node.querySelectorAll('img[src*="/Boveda/"], img[src*="Boveda"], img[data-src*="/Boveda/"], img[data-src*="Boveda"]');
-                            images.forEach(function(img) {
-                                if (!img.dataset.omcProcessed) {
-                                    var url = img.src || img.getAttribute('data-src');
-                                    if (url && isBovedaImage(url)) {
-                                        img.dataset.omcProcessed = 'true';
-                                        hasNewImages = true;
-                                        loadImageWithCache(url).then(function(cachedImg) {
-                                            if (img.src && img.src !== cachedImg.src) {
-                                                img.src = cachedImg.src;
-                                            }
-                                        }).catch(function() {});
-                                    }
+                    if (node.nodeType !== 1) return;
+
+                    if (node.tagName === 'IMG') {
+                        var url = node.src || node.getAttribute('data-src');
+                        if (url && isBovedaImage(url) && !node.dataset.omcProcessed) {
+                            hasNewImages = true;
+                            node.dataset.omcProcessed = 'true';
+                            loadImageWithCache(url).then(function(cachedImg) {
+                                if (node.src && node.src !== cachedImg.src) {
+                                    node.src = cachedImg.src;
                                 }
-                            });
+                            }).catch(function() {});
                         }
+                    }
+
+                    if (node.querySelectorAll) {
+                        var imgs = node.querySelectorAll('img[src*="/Boveda/"], img[src*="Boveda"], img[data-src*="/Boveda/"], img[data-src*="Boveda"]');
+                        imgs.forEach(function(img) {
+                            if (!img.dataset.omcProcessed) {
+                                var url = img.src || img.getAttribute('data-src');
+                                if (url && isBovedaImage(url)) {
+                                    img.dataset.omcProcessed = 'true';
+                                    hasNewImages = true;
+                                    loadImageWithCache(url).then(function(cachedImg) {
+                                        if (img.src && img.src !== cachedImg.src) {
+                                            img.src = cachedImg.src;
+                                        }
+                                    }).catch(function() {});
+                                }
+                            }
+                        });
                     }
                 });
             });
 
             if (hasNewImages) {
-                log('🔄 Nuevas imágenes detectadas');
+                log('🔄 Nuevas imágenes detectadas por el observador');
             }
         });
 
