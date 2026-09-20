@@ -1,8 +1,11 @@
 /* ============================================================
-   OMC-CACHE: Caché para imágenes de Boveda v3.4
+   OMC-CACHE: Caché para imágenes de Boveda v3.5
    - Procesamiento por lotes (concurrencia limitada)
    - Evita reprocesar imágenes ya procesadas
    - Observador mejorado
+   - crossOrigin antes de src (evita canvas tainted)
+   - Retry con cache-buster si canvas tainted
+   - Logs de errores en lugar de silencio
    ============================================================ */
 
 (function() {
@@ -16,9 +19,9 @@
         DEBUG: true,
         FAILED_CACHE_DURATION: 1,
         TIMEOUT: 15000,
-        CONCURRENCY: 4,        // cuántas imágenes procesar a la vez
-        INIT_DELAY: 300,       // ms antes de la primera pasada
-        SECOND_PASS: 2500      // ms para la segunda pasada
+        CONCURRENCY: 4,
+        INIT_DELAY: 300,
+        SECOND_PASS: 2500
     };
 
     const FAILED_KEY = CONFIG.STORAGE_PREFIX + '_failed_';
@@ -259,6 +262,7 @@
 
             if (!isBovedaImage(url)) {
                 var img = new Image();
+                img.crossOrigin = 'anonymous';
                 img.onload = function() { resolve(img); };
                 img.onerror = function() { reject(new Error('Error al cargar')); };
                 img.src = url;
@@ -267,9 +271,11 @@
 
             if (Cache.isFailed(normalized)) {
                 var img = new Image();
+                img.crossOrigin = 'anonymous';
                 img.onload = function() {
-                    Cache.set(normalized, img.src);
-                    resolve(img);
+                    loadFromNetwork(normalized)
+                        .then(function() { resolve(img); })
+                        .catch(function() { resolve(img); });
                 };
                 img.onerror = function() {
                     reject(new Error('Imagen fallida'));
@@ -281,6 +287,7 @@
             var cached = Cache.get(normalized);
             if (cached) {
                 var img = new Image();
+                img.crossOrigin = 'anonymous';
                 img.onload = function() {
                     resolve(img);
                 };
@@ -295,9 +302,13 @@
         });
     }
 
-    function loadFromNetwork(url) {
+    // ============================================================
+    // CARGAR DESDE RED (con retry si canvas tainted)
+    // ============================================================
+    function loadFromNetwork(url, isRetry) {
         return new Promise(function(resolve, reject) {
             var img = new Image();
+            img.crossOrigin = 'anonymous';   // SIEMPRE antes de src
 
             var timeoutId = setTimeout(function() {
                 img.src = '';
@@ -310,12 +321,34 @@
                     var canvas = document.createElement('canvas');
                     canvas.width = img.naturalWidth || img.width;
                     canvas.height = img.naturalHeight || img.height;
+                    if (canvas.width === 0 || canvas.height === 0) {
+                        log('⚠️ Canvas vacío:', url.substring(0, 60));
+                        resolve(img);
+                        return;
+                    }
                     var ctx = canvas.getContext('2d');
                     ctx.drawImage(img, 0, 0);
                     var dataUrl = canvas.toDataURL('image/webp', 0.8);
+                    if (!dataUrl || dataUrl === 'data:,') {
+                        log('⚠️ toDataURL vacío:', url.substring(0, 60));
+                        resolve(img);
+                        return;
+                    }
                     Cache.set(url, dataUrl);
                     resolve(img);
                 } catch (e) {
+                    // Si el canvas está tainted, reintentar con cache-buster
+                    if (e.name === 'SecurityError' && !isRetry) {
+                        log('🔄 Canvas tainted, reintentando con cache-buster:', url.substring(0, 60));
+                        var buster = (url.includes('?') ? '&' : '?') + '_omc=' + Date.now();
+                        loadFromNetwork(url, true)   // nota: url SIN buster, para que la key sea la misma
+                            .then(resolve)
+                            .catch(reject);
+                        // pero cargamos con buster dentro del nuevo loadFromNetwork:
+                        // mejor: llamamos directamente con buster
+                        return;
+                    }
+                    console.error('❌ Error canvas en loadFromNetwork:', e.name, e.message, url.substring(0, 60));
                     resolve(img);
                 }
             };
@@ -326,12 +359,18 @@
                 reject(new Error('Error al cargar: ' + url));
             };
 
-            img.src = url;
+            // Si es retry, añadir cache-buster
+            if (isRetry) {
+                var buster = (url.includes('?') ? '&' : '?') + '_omc=' + Date.now();
+                img.src = url + buster;
+            } else {
+                img.src = url;
+            }
         });
     }
 
     // ============================================================
-    // PROCESAR IMÁGENES POR LOTES (CONCURRENCIA LIMITADA)
+    // PROCESAR IMÁGENES POR LOTES
     // ============================================================
     var isProcessing = false;
 
@@ -344,7 +383,6 @@
         var selector = 'img[src*="/Boveda/"], img[src*="Boveda"], img[data-src*="/Boveda/"], img[data-src*="Boveda"]';
         var allImages = Array.prototype.slice.call(document.querySelectorAll(selector));
 
-        // Filtrar las que ya fueron procesadas
         var pending = allImages.filter(function(img) {
             return !img.dataset.omcProcessed;
         });
@@ -399,7 +437,6 @@
     function forceReloadFailed() {
         log('🔄 Forzando recarga de imágenes fallidas...');
         Cache.clearFailed();
-        // Limpiar marca de procesadas para que se reintenten
         var selector = 'img[src*="/Boveda/"], img[src*="Boveda"], img[data-src*="/Boveda/"], img[data-src*="Boveda"]';
         document.querySelectorAll(selector).forEach(function(img) {
             delete img.dataset.omcProcessed;
@@ -411,7 +448,7 @@
     // INICIALIZACIÓN
     // ============================================================
     function init() {
-        log('🚀 OMC-Cache v3.4 inicializado');
+        log('🚀 OMC-Cache v3.5 inicializado');
 
         Cache.cleanExpired();
 
@@ -423,12 +460,10 @@
             Cache.clearFailed();
         }
 
-        // Primera pasada rápida
         setTimeout(function() {
             processAllBovedaImages();
         }, CONFIG.INIT_DELAY);
 
-        // Segunda pasada por si el DOM cambió
         setTimeout(function() {
             processAllBovedaImages();
         }, CONFIG.SECOND_PASS);
