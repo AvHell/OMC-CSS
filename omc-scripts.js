@@ -3,35 +3,6 @@
    TODOS LOS SCRIPTS UNIFICADOS (v1.1) - CON CACHÉ
    ============================================================ */
 
-// Cargar el módulo de caché
-function loadOMCCache() {
-    return new Promise(function(resolve, reject) {
-        if (typeof OMC !== 'undefined' && OMC.Cache) {
-            resolve();
-            return;
-        }
-        
-        var script = document.createElement('script');
-        script.src = 'https://cdn.jsdelivr.net/gh/AvHell/OMC-CSS@main/omc-cache.js';
-        script.onload = function() {
-            console.log('[OMC] Módulo de caché cargado');
-            resolve();
-        };
-        script.onerror = function() {
-            console.warn('[OMC] No se pudo cargar el caché');
-            reject();
-        };
-        document.head.appendChild(script);
-    });
-}
-
-// Cargar caché ANTES de todo
-loadOMCCache().then(function() {
-    console.log('[OMC] Caché listo');
-}).catch(function() {
-    console.log('[OMC] Caché no disponible, funcionando sin él');
-});
-
 // VARIABLES GLOBALES
 var bandasMap = {};
 var todasBandas = [];
