@@ -12,7 +12,7 @@ function loadOMCCache() {
         }
         
         var script = document.createElement('script');
-        script.src = 'https://avhell.bsite.net/js/omc-cache.js';
+        script.src = 'https://cdn.jsdelivr.net/gh/AvHell/OMC-CSS@main/omc-cache.js';
         script.onload = function() {
             console.log('[OMC] Módulo de caché cargado');
             resolve();
