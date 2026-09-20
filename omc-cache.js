@@ -1,44 +1,39 @@
 /* ============================================================
-   OMC-CACHE: Caché para imágenes de Boveda v3.5
-   - Procesamiento por lotes (concurrencia limitada)
-   - Evita reprocesar imágenes ya procesadas
-   - Observador mejorado
-   - crossOrigin antes de src (evita canvas tainted)
-   - Retry con cache-buster si canvas tainted
-   - Logs de errores en lugar de silencio
+   OMC-CACHE v4.0 - IndexedDB
+   - Guarda Blobs binarios (no base64)
+   - Sin canvas, sin CORS tainted
+   - Límite: ~50% del disco libre
+   - Procesamiento por lotes
+   - Compatible con API anterior (OMC.Cache.load, .stats, .clear)
    ============================================================ */
 
 (function() {
     'use strict';
 
     const CONFIG = {
-        CACHE_DURATION: 160 * 24,
-        STORAGE_PREFIX: 'omc_img_',
+        DB_NAME: 'omc_cache_db',
+        DB_VERSION: 1,
+        STORE_NAME: 'images',
+        CACHE_DURATION: 160 * 24 * 60 * 60 * 1000, // 160 días en ms
+        FAILED_DURATION: 60 * 1000,                // 1 minuto
         BOVEDA_DOMAIN: 'https://avhell.bsite.net/Boveda',
         BOVEDA_RELATIVE: '/Boveda/',
         DEBUG: true,
-        FAILED_CACHE_DURATION: 1,
         TIMEOUT: 15000,
         CONCURRENCY: 4,
         INIT_DELAY: 300,
         SECOND_PASS: 2500
     };
 
-    const FAILED_KEY = CONFIG.STORAGE_PREFIX + '_failed_';
-
     // ============================================================
     // LOGS
     // ============================================================
-    function log(message, data) {
-        if (CONFIG.DEBUG) {
-            console.log('[OMC-Cache]', message, data || '');
-        }
+    function log(msg, data) {
+        if (CONFIG.DEBUG) console.log('[OMC-Cache]', msg, data || '');
     }
 
-    function logError(message, error) {
-        if (CONFIG.DEBUG) {
-            console.error('[OMC-Cache] ⚠️', message, error || '');
-        }
+    function logError(msg, err) {
+        if (CONFIG.DEBUG) console.error('[OMC-Cache] ⚠️', msg, err || '');
     }
 
     // ============================================================
@@ -46,8 +41,7 @@
     // ============================================================
     function isBovedaImage(url) {
         if (!url) return false;
-        return url.includes(CONFIG.BOVEDA_DOMAIN) ||
-               url.includes(CONFIG.BOVEDA_RELATIVE);
+        return url.includes(CONFIG.BOVEDA_DOMAIN) || url.includes(CONFIG.BOVEDA_RELATIVE);
     }
 
     function normalizeUrl(url) {
@@ -55,208 +49,232 @@
         if (url.startsWith(CONFIG.BOVEDA_RELATIVE)) {
             return CONFIG.BOVEDA_DOMAIN + url.replace(CONFIG.BOVEDA_RELATIVE, '/');
         }
-        if (url.includes(CONFIG.BOVEDA_DOMAIN)) {
-            return url;
-        }
+        if (url.includes(CONFIG.BOVEDA_DOMAIN)) return url;
         if (url.includes('/Boveda/')) {
             return CONFIG.BOVEDA_DOMAIN + url.substring(url.indexOf('/Boveda/') + 7);
         }
         return url;
     }
 
-    function getCacheKey(url) {
-        var normalized = normalizeUrl(url);
-        if (!normalized) return CONFIG.STORAGE_PREFIX + 'unknown';
-        var clean = normalized.replace(CONFIG.BOVEDA_DOMAIN, '').replace(/\//g, '_');
-        clean = clean.replace(/[^a-zA-Z0-9_]/g, '');
-        if (clean.length > 100) clean = clean.substring(0, 100);
-        if (!clean) clean = 'unknown_' + Date.now();
-        return CONFIG.STORAGE_PREFIX + clean;
-    }
-
-    function getFailedKey(url) {
-        var normalized = normalizeUrl(url);
-        if (!normalized) return FAILED_KEY + 'unknown';
-        var clean = normalized.replace(CONFIG.BOVEDA_DOMAIN, '').replace(/\//g, '_');
-        clean = clean.replace(/[^a-zA-Z0-9_]/g, '');
-        if (clean.length > 100) clean = clean.substring(0, 100);
-        if (!clean) clean = 'unknown_' + Date.now();
-        return FAILED_KEY + clean;
-    }
-
-    function getNow() {
-        return new Date().getTime();
-    }
-
     // ============================================================
-    // CACHÉ
+    // INDEXEDDB - INICIALIZACIÓN
     // ============================================================
-    const Cache = {
-        get: function(url) {
-            try {
-                var key = getCacheKey(url);
-                var raw = localStorage.getItem(key);
-                if (!raw) return null;
-                var entry = JSON.parse(raw);
-                if (getNow() > entry.expires) {
-                    localStorage.removeItem(key);
-                    return null;
-                }
-                return entry.data;
-            } catch (e) {
-                return null;
+    var dbPromise = null;
+
+    function openDB() {
+        if (dbPromise) return dbPromise;
+
+        dbPromise = new Promise(function(resolve, reject) {
+            if (!window.indexedDB) {
+                reject(new Error('IndexedDB no soportado'));
+                return;
             }
+
+            var request = indexedDB.open(CONFIG.DB_NAME, CONFIG.DB_VERSION);
+
+            request.onupgradeneeded = function(event) {
+                var db = event.target.result;
+                if (!db.objectStoreNames.contains(CONFIG.STORE_NAME)) {
+                    var store = db.createObjectStore(CONFIG.STORE_NAME, { keyPath: 'url' });
+                    store.createIndex('expires', 'expires', { unique: false });
+                    log('📦 ObjectStore creado');
+                }
+            };
+
+            request.onsuccess = function(event) {
+                log('✅ IndexedDB abierta');
+                resolve(event.target.result);
+            };
+
+            request.onerror = function(event) {
+                reject(event.target.error);
+            };
+        });
+
+        return dbPromise;
+    }
+
+    // ============================================================
+    // INDEXEDDB - OPERACIONES
+    // ============================================================
+    function dbGet(url) {
+        return openDB().then(function(db) {
+            return new Promise(function(resolve, reject) {
+                var tx = db.transaction(CONFIG.STORE_NAME, 'readonly');
+                var store = tx.objectStore(CONFIG.STORE_NAME);
+                var req = store.get(url);
+                req.onsuccess = function() {
+                    var entry = req.result;
+                    if (!entry) { resolve(null); return; }
+                    if (Date.now() > entry.expires) {
+                        // Expirado
+                        dbDelete(url).then(function() { resolve(null); });
+                        return;
+                    }
+                    resolve(entry.blob);
+                };
+                req.onerror = function() { reject(req.error); };
+            });
+        });
+    }
+
+    function dbSet(url, blob, durationMs) {
+        return openDB().then(function(db) {
+            return new Promise(function(resolve, reject) {
+                var tx = db.transaction(CONFIG.STORE_NAME, 'readwrite');
+                var store = tx.objectStore(CONFIG.STORE_NAME);
+                var entry = {
+                    url: url,
+                    blob: blob,
+                    expires: Date.now() + durationMs,
+                    created: Date.now()
+                };
+                var req = store.put(entry);
+                req.onsuccess = function() { resolve(true); };
+                req.onerror = function() { reject(req.error); };
+            });
+        });
+    }
+
+    function dbDelete(url) {
+        return openDB().then(function(db) {
+            return new Promise(function(resolve, reject) {
+                var tx = db.transaction(CONFIG.STORE_NAME, 'readwrite');
+                var store = tx.objectStore(CONFIG.STORE_NAME);
+                var req = store.delete(url);
+                req.onsuccess = function() { resolve(true); };
+                req.onerror = function() { reject(req.error); };
+            });
+        });
+    }
+
+    function dbGetAll() {
+        return openDB().then(function(db) {
+            return new Promise(function(resolve, reject) {
+                var tx = db.transaction(CONFIG.STORE_NAME, 'readonly');
+                var store = tx.objectStore(CONFIG.STORE_NAME);
+                var req = store.getAll();
+                req.onsuccess = function() { resolve(req.result || []); };
+                req.onerror = function() { reject(req.error); };
+            });
+        });
+    }
+
+    function dbClear() {
+        return openDB().then(function(db) {
+            return new Promise(function(resolve, reject) {
+                var tx = db.transaction(CONFIG.STORE_NAME, 'readwrite');
+                var store = tx.objectStore(CONFIG.STORE_NAME);
+                var req = store.clear();
+                req.onsuccess = function() { resolve(true); };
+                req.onerror = function() { reject(req.error); };
+            });
+        });
+    }
+
+    // ============================================================
+    // CACHÉ - API PÚBLICA (compatible con la versión anterior)
+    // ============================================================
+    var Cache = {
+        get: function(url) {
+            var normalized = normalizeUrl(url);
+            return dbGet(normalized);
         },
 
-        set: function(url, dataUrl) {
-            try {
-                var key = getCacheKey(url);
-                var entry = {
-                    data: dataUrl,
-                    expires: getNow() + (CONFIG.CACHE_DURATION * 60 * 1000)
-                };
-                localStorage.setItem(key, JSON.stringify(entry));
-                var failedKey = getFailedKey(url);
-                localStorage.removeItem(failedKey);
-                log('✅ Cacheada:', url.substring(0, 50) + '...');
-                return true;
-            } catch (e) {
-                if (e.name === 'QuotaExceededError') {
-                    this.cleanExpired();
-                    try {
-                        var key2 = getCacheKey(url);
-                        var entry2 = {
-                            data: dataUrl,
-                            expires: getNow() + (CONFIG.CACHE_DURATION * 60 * 1000)
-                        };
-                        localStorage.setItem(key2, JSON.stringify(entry2));
-                        return true;
-                    } catch (e2) {
-                        return false;
-                    }
-                }
-                return false;
-            }
+        set: function(url, blob) {
+            var normalized = normalizeUrl(url);
+            return dbSet(normalized, blob, CONFIG.CACHE_DURATION)
+                .then(function() {
+                    log('✅ Cacheada:', normalized.substring(0, 50) + '...');
+                    return true;
+                })
+                .catch(function(e) {
+                    logError('❌ Error al guardar:', e);
+                    return false;
+                });
         },
 
         setFailed: function(url) {
-            try {
-                var key = getFailedKey(url);
-                var entry = {
-                    expires: getNow() + (CONFIG.FAILED_CACHE_DURATION * 60 * 1000)
-                };
-                localStorage.setItem(key, JSON.stringify(entry));
-                return true;
-            } catch (e) {
-                return false;
-            }
+            var normalized = normalizeUrl(url);
+            // Guardamos un Blob vacío con duración corta
+            return dbSet(normalized, new Blob([], { type: 'image/webp' }), CONFIG.FAILED_DURATION)
+                .catch(function() { return false; });
         },
 
         isFailed: function(url) {
-            try {
-                var key = getFailedKey(url);
-                var raw = localStorage.getItem(key);
-                if (!raw) return false;
-                var entry = JSON.parse(raw);
-                if (getNow() > entry.expires) {
-                    localStorage.removeItem(key);
-                    return false;
-                }
-                return true;
-            } catch (e) {
-                return false;
-            }
-        },
-
-        cleanExpired: function() {
-            var keys = Object.keys(localStorage);
-            var count = 0;
-            keys.forEach(function(key) {
-                if (key.startsWith(CONFIG.STORAGE_PREFIX) || key.startsWith(FAILED_KEY)) {
-                    try {
-                        var entry = JSON.parse(localStorage.getItem(key));
-                        if (getNow() > entry.expires) {
-                            localStorage.removeItem(key);
-                            count++;
-                        }
-                    } catch (e) {
-                        localStorage.removeItem(key);
-                        count++;
-                    }
-                }
+            var normalized = normalizeUrl(url);
+            return dbGet(normalized).then(function(blob) {
+                return blob && blob.size === 0;
             });
-            if (count > 0) log('🧹 Limpiados:', count, 'expirados');
-            return count;
         },
 
         clear: function() {
-            var keys = Object.keys(localStorage);
-            var count = 0;
-            keys.forEach(function(key) {
-                if (key.startsWith(CONFIG.STORAGE_PREFIX) || key.startsWith(FAILED_KEY)) {
-                    localStorage.removeItem(key);
-                    count++;
-                }
+            return dbClear().then(function() {
+                log('🗑️ Caché limpiado');
+                return true;
             });
-            log('🗑️ Caché limpiado:', count);
-            return count;
         },
 
         clearFailed: function() {
-            var keys = Object.keys(localStorage);
-            var count = 0;
-            keys.forEach(function(key) {
-                if (key.startsWith(FAILED_KEY)) {
-                    localStorage.removeItem(key);
-                    count++;
-                }
+            return dbGetAll().then(function(entries) {
+                var failed = entries.filter(function(e) {
+                    return e.blob && e.blob.size === 0;
+                });
+                return Promise.all(failed.map(function(e) {
+                    return dbDelete(e.url);
+                })).then(function() {
+                    log('🧹 Fallidos eliminados:', failed.length);
+                    return failed.length;
+                });
             });
-            log('🧹 Fallidos eliminados:', count);
-            return count;
+        },
+
+        cleanExpired: function() {
+            return dbGetAll().then(function(entries) {
+                var now = Date.now();
+                var expired = entries.filter(function(e) {
+                    return e.expires < now;
+                });
+                return Promise.all(expired.map(function(e) {
+                    return dbDelete(e.url);
+                })).then(function() {
+                    if (expired.length > 0) log('🧹 Expirados limpiados:', expired.length);
+                    return expired.length;
+                });
+            });
         },
 
         stats: function() {
-            var keys = Object.keys(localStorage);
-            var total = 0, active = 0, size = 0, failed = 0;
-
-            keys.forEach(function(key) {
-                if (key.startsWith(CONFIG.STORAGE_PREFIX) && !key.startsWith(FAILED_KEY)) {
+            return dbGetAll().then(function(entries) {
+                var now = Date.now();
+                var total = 0, active = 0, expired = 0, failed = 0, size = 0;
+                entries.forEach(function(e) {
+                    if (!e.blob) return;
+                    if (e.blob.size === 0) { failed++; return; }
                     total++;
-                    try {
-                        var entry = JSON.parse(localStorage.getItem(key));
-                        if (getNow() <= entry.expires) {
-                            active++;
-                            if (entry.data) size += entry.data.length;
-                        }
-                    } catch (e) {}
-                }
-                if (key.startsWith(FAILED_KEY)) {
-                    try {
-                        var entry = JSON.parse(localStorage.getItem(key));
-                        if (getNow() <= entry.expires) failed++;
-                    } catch (e) {}
-                }
+                    if (e.expires < now) { expired++; return; }
+                    active++;
+                    size += e.blob.size;
+                });
+                return {
+                    total: total,
+                    active: active,
+                    expired: expired,
+                    failed: failed,
+                    size: Math.round(size / 1024)
+                };
             });
-
-            return {
-                total: total,
-                active: active,
-                expired: total - active,
-                failed: failed,
-                size: Math.round(size / 1024)
-            };
         }
     };
 
     // ============================================================
     // CARGAR IMAGEN CON CACHÉ
     // ============================================================
+    var objectUrls = {};
+
     function loadImageWithCache(url) {
         return new Promise(function(resolve, reject) {
-            if (!url) {
-                reject(new Error('URL vacía'));
-                return;
-            }
+            if (!url) { reject(new Error('URL vacía')); return; }
 
             var normalized = normalizeUrl(url);
 
@@ -269,103 +287,81 @@
                 return;
             }
 
-            if (Cache.isFailed(normalized)) {
-                var img = new Image();
-                img.crossOrigin = 'anonymous';
-                img.onload = function() {
-                    loadFromNetwork(normalized)
-                        .then(function() { resolve(img); })
-                        .catch(function() { resolve(img); });
-                };
-                img.onerror = function() {
-                    reject(new Error('Imagen fallida'));
-                };
-                img.src = normalized;
-                return;
-            }
-
-            var cached = Cache.get(normalized);
-            if (cached) {
-                var img = new Image();
-                img.crossOrigin = 'anonymous';
-                img.onload = function() {
-                    resolve(img);
-                };
-                img.onerror = function() {
-                    loadFromNetwork(normalized).then(resolve).catch(reject);
-                };
-                img.src = cached;
-                return;
-            }
-
-            loadFromNetwork(normalized).then(resolve).catch(reject);
+            // 1. Intentar caché
+            Cache.get(normalized).then(function(blob) {
+                if (blob && blob.size > 0) {
+                    // Tenemos caché
+                    var objectUrl = URL.createObjectURL(blob);
+                    var img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = function() {
+                        resolve(img);
+                    };
+                    img.onerror = function() {
+                        URL.revokeObjectURL(objectUrl);
+                        loadFromNetwork(normalized).then(resolve).catch(reject);
+                    };
+                    img.src = objectUrl;
+                    objectUrls[normalized] = objectUrl;
+                    return;
+                }
+                // No hay caché → red
+                loadFromNetwork(normalized).then(resolve).catch(reject);
+            }).catch(function() {
+                loadFromNetwork(normalized).then(resolve).catch(reject);
+            });
         });
     }
 
     // ============================================================
-    // CARGAR DESDE RED (con retry si canvas tainted)
+    // CARGAR DESDE RED Y GUARDAR EN CACHÉ (sin canvas)
     // ============================================================
-    function loadFromNetwork(url, isRetry) {
+    function loadFromNetwork(url) {
         return new Promise(function(resolve, reject) {
-            var img = new Image();
-            img.crossOrigin = 'anonymous';   // SIEMPRE antes de src
-
             var timeoutId = setTimeout(function() {
-                img.src = '';
                 reject(new Error('Timeout'));
             }, CONFIG.TIMEOUT);
 
-            img.onload = function() {
-                clearTimeout(timeoutId);
-                try {
-                    var canvas = document.createElement('canvas');
-                    canvas.width = img.naturalWidth || img.width;
-                    canvas.height = img.naturalHeight || img.height;
-                    if (canvas.width === 0 || canvas.height === 0) {
-                        log('⚠️ Canvas vacío:', url.substring(0, 60));
-                        resolve(img);
-                        return;
-                    }
-                    var ctx = canvas.getContext('2d');
-                    ctx.drawImage(img, 0, 0);
-                    var dataUrl = canvas.toDataURL('image/webp', 0.8);
-                    if (!dataUrl || dataUrl === 'data:,') {
-                        log('⚠️ toDataURL vacío:', url.substring(0, 60));
-                        resolve(img);
-                        return;
-                    }
-                    Cache.set(url, dataUrl);
-                    resolve(img);
-                } catch (e) {
-                    // Si el canvas está tainted, reintentar con cache-buster
-                    if (e.name === 'SecurityError' && !isRetry) {
-                        log('🔄 Canvas tainted, reintentando con cache-buster:', url.substring(0, 60));
-                        var buster = (url.includes('?') ? '&' : '?') + '_omc=' + Date.now();
-                        loadFromNetwork(url, true)   // nota: url SIN buster, para que la key sea la misma
-                            .then(resolve)
-                            .catch(reject);
-                        // pero cargamos con buster dentro del nuevo loadFromNetwork:
-                        // mejor: llamamos directamente con buster
-                        return;
-                    }
-                    console.error('❌ Error canvas en loadFromNetwork:', e.name, e.message, url.substring(0, 60));
-                    resolve(img);
-                }
-            };
+            // Descargar como Blob con fetch (respeta CORS)
+            fetch(url, { mode: 'cors', credentials: 'omit' })
+                .then(function(response) {
+                    if (!response.ok) throw new Error('HTTP ' + response.status);
+                    return response.blob();
+                })
+                .then(function(blob) {
+                    clearTimeout(timeoutId);
 
-            img.onerror = function() {
-                clearTimeout(timeoutId);
-                Cache.setFailed(url);
-                reject(new Error('Error al cargar: ' + url));
-            };
-
-            // Si es retry, añadir cache-buster
-            if (isRetry) {
-                var buster = (url.includes('?') ? '&' : '?') + '_omc=' + Date.now();
-                img.src = url + buster;
-            } else {
-                img.src = url;
-            }
+                    // Guardar en IndexedDB
+                    Cache.set(url, blob).then(function() {
+                        // Crear ObjectURL para mostrar
+                        var objectUrl = URL.createObjectURL(blob);
+                        var img = new Image();
+                        img.crossOrigin = 'anonymous';
+                        img.onload = function() {
+                            resolve(img);
+                        };
+                        img.onerror = function() {
+                            URL.revokeObjectURL(objectUrl);
+                            reject(new Error('Error al mostrar imagen'));
+                        };
+                        img.src = objectUrl;
+                        objectUrls[url] = objectUrl;
+                    }).catch(function(e) {
+                        logError('Error al guardar en IndexedDB:', e);
+                        // Si falla el guardado, mostrar directamente
+                        var objectUrl = URL.createObjectURL(blob);
+                        var img = new Image();
+                        img.crossOrigin = 'anonymous';
+                        img.onload = function() { resolve(img); };
+                        img.onerror = function() { reject(new Error('Error al mostrar')); };
+                        img.src = objectUrl;
+                    });
+                })
+                .catch(function(error) {
+                    clearTimeout(timeoutId);
+                    Cache.setFailed(url);
+                    reject(error);
+                });
         });
     }
 
@@ -403,8 +399,9 @@
             if (index >= pending.length) {
                 isProcessing = false;
                 log('✅ Procesadas: ' + processed + ', errores: ' + errors);
-                var stats = Cache.stats();
-                log('📊 Caché actual:', stats);
+                Cache.stats().then(function(stats) {
+                    log('📊 Caché actual:', stats);
+                });
                 return;
             }
 
@@ -432,43 +429,17 @@
     }
 
     // ============================================================
-    // FORZAR RECARGA DE FALLIDAS
+    // FORZAR RECARGA
     // ============================================================
     function forceReloadFailed() {
         log('🔄 Forzando recarga de imágenes fallidas...');
-        Cache.clearFailed();
-        var selector = 'img[src*="/Boveda/"], img[src*="Boveda"], img[data-src*="/Boveda/"], img[data-src*="Boveda"]';
-        document.querySelectorAll(selector).forEach(function(img) {
-            delete img.dataset.omcProcessed;
+        Cache.clearFailed().then(function() {
+            var selector = 'img[src*="/Boveda/"], img[src*="Boveda"]';
+            document.querySelectorAll(selector).forEach(function(img) {
+                delete img.dataset.omcProcessed;
+            });
+            processAllBovedaImages();
         });
-        processAllBovedaImages();
-    }
-
-    // ============================================================
-    // INICIALIZACIÓN
-    // ============================================================
-    function init() {
-        log('🚀 OMC-Cache v3.5 inicializado');
-
-        Cache.cleanExpired();
-
-        var stats = Cache.stats();
-        log('📊 Estadísticas iniciales:', stats);
-
-        if (stats.failed > 100) {
-            log('⚠️ Demasiadas fallidas (' + stats.failed + '), limpiando...');
-            Cache.clearFailed();
-        }
-
-        setTimeout(function() {
-            processAllBovedaImages();
-        }, CONFIG.INIT_DELAY);
-
-        setTimeout(function() {
-            processAllBovedaImages();
-        }, CONFIG.SECOND_PASS);
-
-        setupImageObserver();
     }
 
     // ============================================================
@@ -498,7 +469,7 @@
                     }
 
                     if (node.querySelectorAll) {
-                        var imgs = node.querySelectorAll('img[src*="/Boveda/"], img[src*="Boveda"], img[data-src*="/Boveda/"], img[data-src*="Boveda"]');
+                        var imgs = node.querySelectorAll('img[src*="/Boveda/"], img[src*="Boveda"]');
                         imgs.forEach(function(img) {
                             if (!img.dataset.omcProcessed) {
                                 var url = img.src || img.getAttribute('data-src');
@@ -517,18 +488,34 @@
                 });
             });
 
-            if (hasNewImages) {
-                log('🔄 Nuevas imágenes detectadas por el observador');
-            }
+            if (hasNewImages) log('🔄 Nuevas imágenes detectadas');
         });
 
-        observer.observe(document.body, {
-            childList: true,
-            subtree: true
-        });
-
+        observer.observe(document.body, { childList: true, subtree: true });
         log('👀 Observador activado');
         return observer;
+    }
+
+    // ============================================================
+    // INICIALIZACIÓN
+    // ============================================================
+    function init() {
+        log('🚀 OMC-Cache v4.0 (IndexedDB) inicializado');
+
+        openDB().then(function() {
+            return Cache.cleanExpired();
+        }).then(function() {
+            return Cache.stats();
+        }).then(function(stats) {
+            log('📊 Estadísticas iniciales:', stats);
+
+            setTimeout(function() { processAllBovedaImages(); }, CONFIG.INIT_DELAY);
+            setTimeout(function() { processAllBovedaImages(); }, CONFIG.SECOND_PASS);
+        }).catch(function(e) {
+            logError('Error al inicializar IndexedDB:', e);
+        });
+
+        setupImageObserver();
     }
 
     // ============================================================
@@ -541,9 +528,20 @@
         forceReload: forceReloadFailed,
         clear: function() { return Cache.clear(); },
         clearFailed: function() { return Cache.clearFailed(); },
+        cleanExpired: function() { return Cache.cleanExpired(); },
         stats: function() { return Cache.stats(); },
         config: CONFIG,
-        normalizeUrl: normalizeUrl
+        normalizeUrl: normalizeUrl,
+        // Extra: info del DB
+        dbInfo: function() {
+            return openDB().then(function(db) {
+                return {
+                    name: db.name,
+                    version: db.version,
+                    stores: Array.from(db.objectStoreNames)
+                };
+            });
+        }
     };
 
     // ============================================================
@@ -561,5 +559,6 @@
     console.log('  OMC.Cache.forceReload() - Reintentar fallidas');
     console.log('  OMC.Cache.clearFailed() - Limpiar fallidas');
     console.log('  OMC.Cache.clear() - Limpiar todo');
+    console.log('  OMC.Cache.dbInfo() - Info de la DB');
 
 })();
